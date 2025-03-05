@@ -9,6 +9,7 @@ from config import *
 import boto3
 from botocore.exceptions import ClientError
 from concurrent.futures import ThreadPoolExecutor
+import configparser
 
 
 
@@ -22,59 +23,66 @@ def get_all_regions(profile_name):
     ec2 = session.client('ec2')
     regions = [region['RegionName'] for region in ec2.describe_regions()['Regions']]
     return regions
-
 def remove_expired_profiles(profile_name):
-    """ 만료된 프로필을 ~/.aws/credentials 파일에서 삭제 (4줄 제거) """
+    """ 만료된 프로필을 ~/.aws/credentials 파일에서 안전하게 삭제 """
     if not os.path.exists(AWS_CREDENTIALS_FILE):
         return
 
-    with open(AWS_CREDENTIALS_FILE, "r") as f:
-        lines = f.readlines()
+    # configparser를 사용하여 파일 파싱
+    config = configparser.ConfigParser()
+    config.read(AWS_CREDENTIALS_FILE)
+    print("이까지 실행 완료")
+    # 프로필 삭제
+    if profile_name in config:
+        config.remove_section(profile_name)
 
-    new_lines = []
-    skip = False
+        # 변경된 내용 저장
+        with open(AWS_CREDENTIALS_FILE, "w") as f:
+            config.write(f)
 
-    for line in lines:
-        # 현재 profile_name에 해당하는 프로필을 찾았을 때 4줄 삭제
-        if line.strip() == f"[{profile_name}]":
-            skip = True
-            continue  # 현재 줄 스킵
-        elif skip and (line.startswith("aws_access_key_id") or 
-                       line.startswith("aws_secret_access_key") or 
-                       line.startswith("aws_session_token")):
-            continue  # 4줄을 삭제하는 부분
-        else:
-            skip = False  # 다른 프로필로 넘어가면 다시 추가
+        print(f"만료된 프로필 삭제 완료: {profile_name}")
+    else:
+        print(f"삭제할 프로필이 존재하지 않음: {profile_name}")
 
-        new_lines.append(line)
-
-    # 변경된 내용 다시 저장
-    with open(AWS_CREDENTIALS_FILE, "w") as f:
-        f.writelines(new_lines)
-
-    print(f"만료된 프로필 삭제 완료: {profile_name}")
+import botocore
 
 def refresh_credentials(account):
     role_arn = f"arn:aws:iam::{account['account_id']}:role/{account['role_name']}"
     profile_name = account["name"]
+    print(f'refresh_credentials | profile_name: {profile_name}')
     
     try:
         # 현재 자격 증명 확인
         session = boto3.Session(profile_name=profile_name)
         sts = session.client('sts')
-        identity = sts.get_caller_identity()
-        current_arn = identity['Arn']
+
+        try:
+            identity = sts.get_caller_identity()
+            current_arn = identity['Arn']
+            print("refresh_credentials - ", identity)
+
+            # 기존 자격 증명이 여전히 유효한 경우
+            if current_arn.startswith(f"arn:aws:sts::{account['account_id']}:assumed-role/{account['role_name']}"):
+                print(f"✅ 이미 {profile_name} 역할 사용 중, 갱신 생략")
+                return
+            else:
+                print("⚠️ 현재 자격 증명이 유효하지 않음, 새로 발급 필요")
+                
+        except botocore.exceptions.ClientError as e:
+            print(f"🔴 STS 호출 오류 발생: {str(e)}")
+            print("⚠️ 기존 자격 증명 무효화, 새로 발급 시작")
+
+        except botocore.exceptions.NoCredentialsError:
+            print("🔴 자격 증명 없음: 새로 발급 필요")
+
+        except Exception as e:
+            print(f"⚠️ 알 수 없는 예외 발생: {str(e)}")
         
-        if current_arn.startswith(f"arn:aws:sts::{account['account_id']}:assumed-role/{account['role_name']}"):
-            print(f"이미 {profile_name} 역할 사용 중, 갱신 생략")
-            return
-            
-    except (ClientError, Exception):
         # 기존 프로필 삭제
+        print("🛠 만료된 기존 프로필 삭제 로직 시작")
         remove_expired_profiles(profile_name)
         
         # 자격 증명 갱신
-        sts = boto3.client('sts')
         assumed_role = sts.assume_role(
             RoleArn=role_arn,
             RoleSessionName=SESSION_NAME,
@@ -89,7 +97,13 @@ def refresh_credentials(account):
             f.write(f"aws_session_token={assumed_role['Credentials']['SessionToken']}\n")
             f.write("region=ap-northeast-2\n")  # 기본 리전 설정
             
-        print(f"자격 증명 갱신 완료: {profile_name}")
+        print(f"✅ 자격 증명 갱신 완료: {profile_name}")
+
+    except botocore.exceptions.ClientError as e:
+        print(f"🚨 STS AssumeRole 실패: {str(e)}")
+    except Exception as e:
+        print(f"🚨 예외 발생: {str(e)}")
+
 
 def init_db():
     try:
@@ -356,7 +370,9 @@ def main():
             futures = []
             # 계정별 & 리전별 인스턴스 개수 조회
             for account in accounts:
+                print("account: ", account)
                 profile_name = account["name"]
+                print("profile_name: ", profile_name)
                 account_id = account["account_id"]
                 regions = get_all_regions(profile_name)
                 
